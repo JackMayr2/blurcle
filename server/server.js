@@ -8,6 +8,44 @@ const { google } = require('googleapis');
 
 const app = express();
 
+// In-memory store for ingested examples (for demo purposes)
+const examples = [];
+
+// Endpoint to save (ingest) file content
+app.post('/ingest', express.json(), (req, res) => {
+  if (!req.user) return res.status(401).send('Unauthorized');
+  const { fileId, content } = req.body;
+  // For simplicity, we push the file content into our in-memory array.
+  examples.push({ fileId, content });
+  console.log(`Ingested file ${fileId}`);
+  res.json({ success: true });
+});
+
+
+app.post('/generate', express.json(), async (req, res) => {
+  if (!req.user) return res.status(401).send('Unauthorized');
+  const { prompt } = req.body;
+
+  // Combine the incoming prompt with the ingested examples.
+  let combinedPrompt = prompt + "\n\nExamples:\n";
+  examples.forEach(example => {
+    combinedPrompt += example.content + "\n---\n";
+  });
+
+  // Here you’d call your LLM API (like OpenAI's) with combinedPrompt.
+  // For demonstration, we’ll just return the combined prompt.
+  res.json({ generatedContent: combinedPrompt });
+});
+
+
+app.use((req, res, next) => {
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; connect-src 'self' https://*.google.com https://*.googleapis.com https://www.gstatic.com https://*.googlevideo.com https://csp.withgoogle.com; script-src 'self' https://apis.google.com; style-src 'self' 'unsafe-inline';"
+  );
+  next();
+});
+
 // Allow CORS from our client app
 app.use(cors({
   origin: 'http://localhost:5173', // your Vite dev server port
@@ -114,6 +152,66 @@ app.get('/auth/logout', (req, res, next) => {
       });
     });
   });
+
+
+
+// Endpoint to fetch file content by ID
+app.get('/drive/file-content/:fileId', async (req, res) => {
+  if (!req.user) return res.status(401).send('Unauthorized');
+
+  try {
+    // Create an OAuth2 client with the stored access token
+    const oauth2Client = new google.auth.OAuth2();
+    oauth2Client.setCredentials({ access_token: req.user.accessToken });
+
+    const drive = google.drive({ version: 'v3', auth: oauth2Client });
+    const fileId = req.params.fileId;
+
+    // First, get the file metadata so we can check its mime type.
+    const metadata = await drive.files.get({
+      fileId,
+      fields: 'id, name, mimeType'
+    });
+
+    let content = '';
+
+    if (metadata.data.mimeType === 'application/vnd.google-apps.document') {
+      // If it's a Google Doc, export it as plain text.
+      const exportResponse = await drive.files.export(
+        { fileId, mimeType: 'text/plain' },
+        { responseType: 'stream' }
+      );
+
+      // Stream the exported content into a variable.
+      await new Promise((resolve, reject) => {
+        exportResponse.data.on('data', (chunk) => {
+          content += chunk;
+        });
+        exportResponse.data.on('end', resolve);
+        exportResponse.data.on('error', reject);
+      });
+    } else {
+      // For other file types, we could download directly. Here we'll try to get it as text.
+      const fileResponse = await drive.files.get({
+        fileId,
+        alt: 'media'
+      }, { responseType: 'stream' });
+
+      await new Promise((resolve, reject) => {
+        fileResponse.data.on('data', (chunk) => {
+          content += chunk;
+        });
+        fileResponse.data.on('end', resolve);
+        fileResponse.data.on('error', reject);
+      });
+    }
+
+    res.json({ fileId, content });
+  } catch (error) {
+    console.error('Error fetching file content:', error);
+    res.status(500).json({ error: 'Error fetching file content' });
+  }
+});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
